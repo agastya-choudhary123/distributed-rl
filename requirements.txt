@@ -1,0 +1,6 @@
+torch>=2.0
+numpy>=1.24
+gymnasium>=0.28
+fastapi>=0.110
+uvicorn>=0.29
+websockets>=12.0

@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Distributed RL — Live Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+           background: #0d1117; color: #e6edf3; }
+    header { padding: 14px 20px; border-bottom: 1px solid #21262d;
+             display: flex; align-items: center; gap: 12px; }
+    header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+    #status { font-size: 13px; color: #8b949e; }
+    .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block;
+           background: #f85149; margin-right: 5px; }
+    .dot.on { background: #3fb950; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 16px; }
+    .card { background: #161b22; border: 1px solid #21262d; border-radius: 8px;
+            padding: 12px 14px; }
+    .card h2 { font-size: 13px; margin: 0 0 10px; font-weight: 600; color: #adbac7; }
+    canvas { width: 100% !important; height: 240px !important; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #21262d; }
+    th { color: #8b949e; font-weight: 500; }
+    .alive { color: #3fb950; } .dead { color: #f85149; }
+    @media (max-width: 860px) { .grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Distributed RL Training — Live Internals</h1>
+    <span id="status"><span class="dot" id="dot"></span>connecting…</span>
+  </header>
+  <div class="grid">
+    <div class="card"><h2>Per-worker episode return</h2><canvas id="reward"></canvas></div>
+    <div class="card"><h2>Per-worker gradient L2 norm</h2><canvas id="grad"></canvas></div>
+    <div class="card"><h2>Per-worker actor loss</h2><canvas id="actor_loss"></canvas></div>
+    <div class="card"><h2>Per-worker critic loss</h2><canvas id="critic_loss"></canvas></div>
+    <div class="card"><h2>Per-worker policy entropy</h2><canvas id="entropy"></canvas></div>
+    <div class="card"><h2>Weight updates / sec (10s rolling)</h2><canvas id="freq"></canvas></div>
+    <div class="card"><h2>Worker health</h2><table id="health">
+      <thead><tr><th>worker</th><th>status</th><th>last heartbeat</th><th>latest reward</th></tr></thead>
+      <tbody></tbody></table></div>
+  </div>
+
+<script>
+const MAX_POINTS = 500;
+const COLORS = ["#58a6ff","#3fb950","#d29922","#f778ba","#a371f7","#ff7b72","#39c5cf","#e3b341"];
+
+function mkChart(id, yLabel) {
+  return new Chart(document.getElementById(id), {
+    type: "line",
+    data: { datasets: [] },
+    options: {
+      animation: false, parsing: false, responsive: true, maintainAspectRatio: false,
+      scales: {
+        x: { type: "linear", title: { display: true, text: "global step" },
+             ticks: { color: "#8b949e" }, grid: { color: "#21262d" } },
+        y: { title: { display: true, text: yLabel },
+             ticks: { color: "#8b949e" }, grid: { color: "#21262d" } }
+      },
+      plugins: { legend: { labels: { color: "#adbac7", boxWidth: 12 } } }
+    }
+  });
+}
+
+const rewardChart = mkChart("reward", "mean episode return");
+const gradChart   = mkChart("grad", "grad L2 norm");
+const actorLossChart = mkChart("actor_loss", "actor loss");
+const criticLossChart = mkChart("critic_loss", "critic loss");
+const entropyChart = mkChart("entropy", "entropy");
+const freqChart   = mkChart("freq", "updates / sec");
+
+const datasets = { reward: {}, grad: {}, actor_loss: {}, critic_loss: {}, entropy: {} };
+function dsFor(chart, store, wid) {
+  if (store[wid]) return store[wid];
+  const color = COLORS[wid % COLORS.length];
+  const ds = { label: "worker " + wid, data: [], borderColor: color,
+               backgroundColor: color, pointRadius: 0, borderWidth: 1.5, tension: 0.2 };
+  store[wid] = ds; chart.data.datasets.push(ds); return ds;
+}
+function push(ds, x, y) {
+  ds.data.push({ x, y });
+  if (ds.data.length > MAX_POINTS) ds.data.shift();
+}
+
+// Worker health table + latest reward.
+const health = {}; // wid -> {status, lastHeartbeat, reward}
+function renderHealth() {
+  const tb = document.querySelector("#health tbody");
+  tb.innerHTML = "";
+  Object.keys(health).sort((a,b)=>a-b).forEach(wid => {
+    const h = health[wid];
+    const ago = h.lastHeartbeat ? Math.round((Date.now()-h.lastHeartbeat)/1000)+"s ago" : "—";
+    const cls = h.status === "DEAD" ? "dead" : "alive";
+    tb.insertAdjacentHTML("beforeend",
+      `<tr><td>${wid}</td><td class="${cls}">${h.status||"?"}</td>`+
+      `<td>${ago}</td><td>${h.reward==null?"—":h.reward.toFixed(2)}</td></tr>`);
+  });
+}
+
+// Update-frequency rolling window.
+const updateTimes = [];
+const freqDs = { label: "updates/sec", data: [], borderColor: "#58a6ff",
+                 backgroundColor: "#58a6ff", pointRadius: 0, borderWidth: 1.5 };
+freqChart.data.datasets.push(freqDs);
+
+setInterval(() => {
+  rewardChart.update();
+  gradChart.update();
+  actorLossChart.update();
+  criticLossChart.update();
+  entropyChart.update();
+  freqChart.update();
+  renderHealth();
+}, 500);
+
+function onMessage(m) {
+  if (m.type === "heartbeat") {
+    const wid = m.worker_id;
+    push(dsFor(rewardChart, datasets.reward, wid), m.global_step, m.episode_reward);
+    if (m.avg_actor_loss !== undefined)
+      push(dsFor(actorLossChart, datasets.actor_loss, wid), m.global_step, m.avg_actor_loss);
+    if (m.avg_critic_loss !== undefined)
+      push(dsFor(criticLossChart, datasets.critic_loss, wid), m.global_step, m.avg_critic_loss);
+    if (m.avg_entropy !== undefined)
+      push(dsFor(entropyChart, datasets.entropy, wid), m.global_step, m.avg_entropy);
+    health[wid] = health[wid] || {};
+    health[wid].lastHeartbeat = Date.now();
+    health[wid].reward = m.episode_reward;
+    if (!health[wid].status) health[wid].status = "ALIVE";
+  } else if (m.type === "weight_update") {
+    const norms = m.per_worker_grad_norms || {};
+    for (const wid in norms) {
+      push(dsFor(gradChart, datasets.grad, +wid), m.global_step, norms[wid]);
+    }
+    const st = m.worker_statuses || {};
+    for (const wid in st) { health[wid] = health[wid] || {}; health[wid].status = st[wid]; }
+
+    const now = m.timestamp * 1000;
+    updateTimes.push(now);
+    while (updateTimes.length && now - updateTimes[0] > 10000) updateTimes.shift();
+    const perSec = updateTimes.length / 10.0;
+    push(freqDs, m.global_step, perSec);
+  }
+}
+
+function connect() {
+  const ws = new WebSocket("ws://" + location.host + "/ws");
+  const dot = document.getElementById("dot"), status = document.getElementById("status");
+  ws.onopen = () => { dot.classList.add("on"); status.lastChild.textContent = "connected"; };
+  ws.onclose = () => { dot.classList.remove("on"); status.lastChild.textContent = "reconnecting…";
+                       setTimeout(connect, 1000); };
+  ws.onmessage = (e) => { try { onMessage(JSON.parse(e.data)); } catch (_) {} };
+}
+connect();
+</script>
+</body>
+</html>

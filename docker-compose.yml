@@ -1,0 +1,86 @@
+name: distributed-rl
+
+# Simulates a multi-machine cluster: the parameter server and each worker run
+# as separate containers with separate network identities, talking only over
+# TCP. Swap the bridge network for real hosts and nothing in the code changes.
+#
+# The dashboard runs inside the parameter-server container because it reads
+# metrics through a multiprocessing.Queue (shared memory), which cannot cross
+# a container boundary.
+
+# One image, three roles. Only the server declares `build:` so the image is
+# built once; the workers reuse the same tag instead of running concurrent
+# builds that each pull torch.
+x-common: &common
+  image: distributed-rl:latest
+  environment:
+    - PYTHONUNBUFFERED=1
+  networks:
+    - drl-network
+
+services:
+  parameter-server:
+    <<: *common
+    build: .
+    container_name: drl-server
+    command:
+      - python3
+      - run_server.py
+      - --env=swingbot
+      - --num_workers=2
+      - --server_host=0.0.0.0
+      - --server_port=9999
+      - --max_steps=400
+      - --checkpoint_interval=50
+      - --dashboard
+      - --dashboard_port=8000
+    ports:
+      - "9999:9999"
+      - "8000:8000"
+    volumes:
+      - ./checkpoints:/app/checkpoints
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import socket;socket.create_connection(('127.0.0.1',9999),timeout=2)"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 3s
+
+  worker-0:
+    <<: *common
+    container_name: drl-worker-0
+    command:
+      - python3
+      - run_worker.py
+      - "0"
+      - --env=swingbot
+      - --server_host=parameter-server
+      - --server_port=9999
+      - --envs_per_worker=4
+      - --rollout_length=256
+      - --max_steps=400
+    depends_on:
+      parameter-server:
+        condition: service_healthy
+
+  worker-1:
+    <<: *common
+    container_name: drl-worker-1
+    command:
+      - python3
+      - run_worker.py
+      - "1"
+      - --env=swingbot
+      - --server_host=parameter-server
+      - --server_port=9999
+      - --envs_per_worker=4
+      - --rollout_length=256
+      - --max_steps=400
+    depends_on:
+      parameter-server:
+        condition: service_healthy
+
+networks:
+  drl-network:
+    driver: bridge

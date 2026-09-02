@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+
+checkpoints/
+checkpoints_e2e/
+checkpoints_test/
+*.pkl
+*.log
+
+.DS_Store
